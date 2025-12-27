@@ -1,0 +1,1047 @@
+package com.example.bleattendance.data.repository
+
+import com.example.bleattendance.data.db.*
+import com.example.bleattendance.data.supabase.SupabaseApiService
+import com.example.bleattendance.data.supabase.models.*
+import com.example.bleattendance.model.StudentInfo
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withTimeout
+
+class SupabaseRepository(
+    private val localDatabase: AppDatabase,
+    private val supabaseApiService: SupabaseApiService
+) {
+    private val teacherDao = localDatabase.teacherDao()
+    private val studentDao = localDatabase.studentDao()
+    private val attendanceDao = localDatabase.attendanceDao()
+    private val academicConfigDao = localDatabase.academicConfigDao()
+    private val studentGroupDao = localDatabase.studentGroupDao()
+    private val classSessionDao = localDatabase.classSessionDao()
+    private val assignmentDao = localDatabase.assignmentDao()
+    private val submissionDao = localDatabase.submissionDao()
+
+    // Teacher operations with sync
+    suspend fun createTeacher(email: String, name: String, subject: String): Result<Unit> {
+        return try {
+            println("🔍 Creating teacher locally: $email")
+            // Create locally first
+            val teacherEntity = TeacherEntity(email, name, subject)
+            teacherDao.insertTeacher(teacherEntity)
+            println("✅ Teacher created locally successfully")
+            
+            // Sync to Supabase
+            println("🔄 Syncing teacher to Supabase...")
+            val request = CreateTeacherRequest(email, name, subject)
+            val supabaseResult = supabaseApiService.createTeacher(request)
+            if (supabaseResult.isSuccess) {
+                println("✅ Teacher synced to Supabase successfully")
+            } else {
+                println("⚠️ Failed to sync teacher to Supabase: ${supabaseResult.exceptionOrNull()?.message}")
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            println("❌ Failed to create teacher: ${e.message}")
+            e.printStackTrace()
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getTeacher(): Flow<TeacherEntity?> {
+        return teacherDao.getTeacher()
+    }
+
+    suspend fun syncTeacherFromSupabase(email: String): Result<Unit> {
+        return try {
+            val result = supabaseApiService.getTeacher(email)
+            result.getOrNull()?.let { supabaseTeacher ->
+                val teacherEntity = TeacherEntity(
+                    email = supabaseTeacher.email,
+                    name = supabaseTeacher.name,
+                    subject = supabaseTeacher.subject
+                )
+                teacherDao.insertTeacher(teacherEntity)
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // Class operations with sync
+    suspend fun createClass(
+        teacherEmail: String,
+        subjectName: String,
+        groupId: String,
+        classSchedule: String? = null
+    ): Result<Int> {
+        return try {
+            // First, ensure the student group exists
+            val groupExists = studentGroupDao.getGroupById(groupId).first() != null
+            if (!groupExists) {
+                println("🔍 Student group doesn't exist, creating it...")
+                // Parse groupId to extract components (e.g., "IT_2025-2029_A_ALL_Sem1")
+                val parts = groupId.split("_")
+                if (parts.size >= 5) {
+                    val branch = parts[0]
+                    val yearRange = parts[1].split("-")
+                    val admissionYear = yearRange[0].toIntOrNull() ?: 2025
+                    val graduationYear = yearRange[1].toIntOrNull() ?: 2029
+                    val division = parts[2]
+                    // Handle "ALL" batch case (when batch was "None")
+                    val batch = if (parts[3] == "ALL") 0 else parts[3].toIntOrNull() ?: 1
+                    val semester = parts[4].replace("Sem", "").toIntOrNull() ?: 1
+                    
+                    println("🔍 Parsed groupId components:")
+                    println("   - Branch: $branch")
+                    println("   - Admission Year: $admissionYear")
+                    println("   - Graduation Year: $graduationYear")
+                    println("   - Division: $division")
+                    println("   - Batch: $batch")
+                    println("   - Semester: $semester")
+                    
+                    // Ensure default academic config exists and get its ID
+                    var academicConfigId = 1 // Default fallback
+                    val activeConfig = academicConfigDao.getActiveConfig().first()
+                    if (activeConfig == null) {
+                        println("🔍 Creating default academic config...")
+                        val createConfigResult = createAcademicConfig(
+                            programName = "Engineering",
+                            durationYears = 4,
+                            totalSemesters = 8,
+                            semesterDurationMonths = 6
+                        )
+                        if (createConfigResult.isFailure) {
+                            println("❌ Failed to create academic config: ${createConfigResult.exceptionOrNull()?.message}")
+                            return Result.failure(createConfigResult.exceptionOrNull() ?: Exception("Failed to create academic config"))
+                        }
+                        println("✅ Default academic config created")
+                        // Get the newly created config ID
+                        val newConfig = academicConfigDao.getActiveConfig().first()
+                        academicConfigId = newConfig?.configId ?: 1
+                    } else {
+                        academicConfigId = activeConfig.configId
+                        println("✅ Using existing academic config: ${activeConfig.programName}")
+                    }
+                    
+                    // Create the student group with the academic config
+                    println("🔍 Creating student group with:")
+                    println("   - groupId: $groupId")
+                    println("   - branch: $branch")
+                    println("   - admissionYear: $admissionYear")
+                    println("   - graduationYear: $graduationYear")
+                    println("   - division: $division")
+                    println("   - batch: $batch")
+                    println("   - semester: $semester")
+                    println("   - academicConfigId: $academicConfigId")
+                    
+                    val createGroupResult = createStudentGroup(
+                        groupId = groupId,
+                        branch = branch,
+                        admissionYear = admissionYear,
+                        graduationYear = graduationYear,
+                        division = division,
+                        batch = batch,
+                        semester = semester,
+                        academicConfigId = academicConfigId
+                    )
+                    
+                    if (createGroupResult.isFailure) {
+                        println("❌ Failed to create student group: ${createGroupResult.exceptionOrNull()?.message}")
+                        return Result.failure(createGroupResult.exceptionOrNull() ?: Exception("Failed to create student group"))
+                    }
+                    println("✅ Student group created successfully: $groupId")
+                } else {
+                    println("❌ Invalid groupId format: $groupId")
+                    return Result.failure(Exception("Invalid groupId format"))
+                }
+            } else {
+                println("✅ Student group already exists: $groupId")
+            }
+            
+            // Create locally first
+            val classEntity = ClassEntity(
+                teacherEmail = teacherEmail,
+                subjectName = subjectName,
+                groupId = groupId,
+                classSchedule = classSchedule
+            )
+            val insertedId = teacherDao.insertClass(classEntity)
+            println("✅ Class inserted with ID: $insertedId")
+            
+                                    // Sync to Supabase
+                        println("🔄 Syncing class to Supabase...")
+                        val request = CreateClassRequest(teacherEmail, subjectName, groupId, classSchedule)
+                        val supabaseResult = supabaseApiService.createClass(request)
+                        if (supabaseResult.isSuccess) {
+                            println("✅ Class synced to Supabase successfully")
+                        } else {
+                            println("⚠️ Failed to sync class to Supabase: ${supabaseResult.exceptionOrNull()?.message}")
+                        }
+            
+            Result.success(insertedId.toInt())
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getClassesForTeacher(teacherEmail: String): Flow<List<ClassEntity>> {
+        return teacherDao.getClassesForTeacher(teacherEmail)
+    }
+
+    suspend fun syncClassesFromSupabase(teacherEmail: String): Result<Unit> {
+        return try {
+            val result = supabaseApiService.getClassesByTeacher(teacherEmail)
+            result.getOrNull()?.forEach { supabaseClass ->
+                val classEntity = ClassEntity(
+                    classId = supabaseClass.class_id ?: 0,
+                    teacherEmail = supabaseClass.teacher_email,
+                    subjectName = supabaseClass.subject_name,
+                    groupId = supabaseClass.group_id
+                )
+                val insertedId = teacherDao.insertClass(classEntity)
+                println("✅ Synced class '${supabaseClass.subject_name}' with local ID: $insertedId")
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // Student operations with sync
+    suspend fun createStudent(
+        email: String,
+        name: String,
+        rollNumber: String,
+        branch: String,
+        admissionYear: Int,
+        graduationYear: Int,
+        division: String,
+        batch: Int,
+        currentSemester: Int,
+        groupId: String
+    ): Result<Unit> {
+        return try {
+            // First, ensure the student group exists
+            val groupExists = studentGroupDao.getGroupById(groupId).first() != null
+            if (!groupExists) {
+                println("🔍 Student group doesn't exist, creating it...")
+                // Parse groupId to extract components (e.g., "IT_2025-2029_B_1_Sem1")
+                val parts = groupId.split("_")
+                if (parts.size >= 5) {
+                    val branchFromGroup = parts[0]
+                    val yearRange = parts[1].split("-")
+                    val admissionYearFromGroup = yearRange[0].toIntOrNull() ?: admissionYear
+                    val graduationYearFromGroup = yearRange[1].toIntOrNull() ?: graduationYear
+                    val divisionFromGroup = parts[2]
+                    // Handle "ALL" batch case (when batch was "None")
+                    val batchFromGroup = if (parts[3] == "ALL") 0 else parts[3].toIntOrNull() ?: batch
+                    val semesterFromGroup = parts[4].replace("Sem", "").toIntOrNull() ?: currentSemester
+                    
+                    println("🔍 Parsed groupId components:")
+                    println("   - Branch: $branchFromGroup")
+                    println("   - Admission Year: $admissionYearFromGroup")
+                    println("   - Graduation Year: $graduationYearFromGroup")
+                    println("   - Division: $divisionFromGroup")
+                    println("   - Batch: $batchFromGroup")
+                    println("   - Semester: $semesterFromGroup")
+                    
+                    // Ensure default academic config exists and get its ID
+                    var academicConfigId = 1 // Default fallback
+                    val activeConfig = academicConfigDao.getActiveConfig().first()
+                    if (activeConfig == null) {
+                        println("🔍 Creating default academic config...")
+                        val createConfigResult = createAcademicConfig(
+                            programName = "Engineering",
+                            durationYears = 4,
+                            totalSemesters = 8,
+                            semesterDurationMonths = 6
+                        )
+                        if (createConfigResult.isFailure) {
+                            println("❌ Failed to create academic config: ${createConfigResult.exceptionOrNull()?.message}")
+                            return Result.failure(createConfigResult.exceptionOrNull() ?: Exception("Failed to create academic config"))
+                        }
+                        println("✅ Default academic config created")
+                        // Get the newly created config ID
+                        val newConfig = academicConfigDao.getActiveConfig().first()
+                        academicConfigId = newConfig?.configId ?: 1
+                    } else {
+                        academicConfigId = activeConfig.configId
+                        println("✅ Using existing academic config: ${activeConfig.programName}")
+                    }
+                    
+                    // Create the student group with the academic config
+                    println("🔍 Creating student group with:")
+                    println("   - groupId: $groupId")
+                    println("   - branch: $branchFromGroup")
+                    println("   - admissionYear: $admissionYearFromGroup")
+                    println("   - graduationYear: $graduationYearFromGroup")
+                    println("   - division: $divisionFromGroup")
+                    println("   - batch: $batchFromGroup")
+                    println("   - semester: $semesterFromGroup")
+                    println("   - academicConfigId: $academicConfigId")
+                    
+                    val createGroupResult = createStudentGroup(
+                        groupId = groupId,
+                        branch = branchFromGroup,
+                        admissionYear = admissionYearFromGroup,
+                        graduationYear = graduationYearFromGroup,
+                        division = divisionFromGroup,
+                        batch = batchFromGroup,
+                        semester = semesterFromGroup,
+                        academicConfigId = academicConfigId
+                    )
+                    
+                    if (createGroupResult.isFailure) {
+                        println("❌ Failed to create student group: ${createGroupResult.exceptionOrNull()?.message}")
+                        return Result.failure(createGroupResult.exceptionOrNull() ?: Exception("Failed to create student group"))
+                    }
+                    println("✅ Student group created successfully: $groupId")
+                } else {
+                    println("❌ Invalid groupId format: $groupId")
+                    return Result.failure(Exception("Invalid groupId format"))
+                }
+            } else {
+                println("✅ Student group already exists: $groupId")
+            }
+            
+            // Create locally first
+            val studentEntity = StudentEntity(
+                email = email,
+                name = name,
+                rollNumber = rollNumber,
+                branch = branch,
+                admissionYear = admissionYear,
+                graduationYear = graduationYear,
+                division = division,
+                batch = batch,
+                currentSemester = currentSemester,
+                groupId = groupId
+            )
+            studentDao.insertStudent(studentEntity)
+            
+            // Sync to Supabase
+            val request = CreateStudentRequest(
+                email = email,
+                name = name,
+                roll_number = rollNumber,
+                branch = branch,
+                admission_year = admissionYear,
+                graduation_year = graduationYear,
+                division = division,
+                batch = batch,
+                current_semester = currentSemester,
+                group_id = groupId
+            )
+            supabaseApiService.createStudent(request)
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getStudent(): Flow<StudentEntity?> {
+        return studentDao.getStudent()
+    }
+
+    suspend fun getStudentsByGroup(groupId: String): Flow<List<StudentEntity>> {
+        return studentDao.getStudentsByGroup(groupId)
+    }
+
+    suspend fun syncStudentsFromSupabase(groupId: String): Result<Unit> {
+        return try {
+            val result = supabaseApiService.getStudentsByGroup(groupId)
+            result.getOrNull()?.forEach { supabaseStudent ->
+                val studentEntity = StudentEntity(
+                    email = supabaseStudent.email,
+                    name = supabaseStudent.name,
+                    rollNumber = supabaseStudent.roll_number,
+                    branch = supabaseStudent.branch,
+                    admissionYear = supabaseStudent.admission_year,
+                    graduationYear = supabaseStudent.graduation_year,
+                    division = supabaseStudent.division,
+                    batch = supabaseStudent.batch,
+                    currentSemester = supabaseStudent.current_semester,
+                    groupId = supabaseStudent.group_id
+                )
+                studentDao.insertStudent(studentEntity)
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // Class Session operations
+    suspend fun createClassSession(
+        classId: Int,
+        scheduledDate: String,
+        startTime: String,
+        endTime: String,
+        sessionCode: String
+    ): Result<Int> {
+        return try {
+            println("🔄 Creating class session: classId=$classId, date=$scheduledDate, time=$startTime-$endTime, code=$sessionCode")
+            
+            // First, save to local database
+            val sessionEntity = ClassSessionEntity(
+                classId = classId,
+                scheduledDate = scheduledDate,
+                startTime = startTime,
+                endTime = endTime,
+                sessionCode = sessionCode
+            )
+            classSessionDao.insertSession(sessionEntity)
+            println("✅ Class session saved locally with ID: ${sessionEntity.sessionId}")
+            
+            // Then, sync to Supabase
+            val request = CreateClassSessionRequest(
+                class_id = classId,
+                scheduled_date = scheduledDate,
+                start_time = startTime,
+                end_time = endTime,
+                session_code = sessionCode
+            )
+            val supabaseResult = supabaseApiService.createClassSession(request)
+            if (supabaseResult.isSuccess) {
+                println("✅ Class session synced to Supabase successfully")
+            } else {
+                println("⚠️ Failed to sync class session to Supabase: ${supabaseResult.exceptionOrNull()?.message}")
+            }
+            
+            Result.success(sessionEntity.sessionId)
+        } catch (e: Exception) {
+            println("❌ Error creating class session: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getClassSessionsForClass(classId: Int): Flow<List<ClassSessionEntity>> {
+        return classSessionDao.getSessionsForClass(classId)
+    }
+
+    suspend fun getTodaysSessions(date: String): Flow<List<ClassSessionEntity>> {
+        return classSessionDao.getTodaysSessions(date)
+    }
+
+    suspend fun updateClassSessionStatus(sessionId: Int, status: String): Result<Unit> {
+        return try {
+            println("🔄 Updating class session status: sessionId=$sessionId, status=$status")
+            
+            // First, update local database
+            val session = classSessionDao.getSessionById(sessionId).first()
+            if (session != null) {
+                val updatedSession = session.copy(status = status)
+                classSessionDao.updateSession(updatedSession)
+                println("✅ Class session status updated locally")
+            } else {
+                println("⚠️ Class session not found locally: $sessionId")
+            }
+            
+            // Then, sync to Supabase
+            val supabaseResult = supabaseApiService.updateClassSessionStatus(sessionId, status)
+            if (supabaseResult.isSuccess) {
+                println("✅ Class session status synced to Supabase successfully")
+            } else {
+                println("⚠️ Failed to sync class session status to Supabase: ${supabaseResult.exceptionOrNull()?.message}")
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            println("❌ Error updating class session status: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // Attendance session operations with sync
+    suspend fun createAttendanceSession(
+        sessionId: Int,
+        studentEmail: String,
+        attendanceStatus: String,
+        markedVia: String? = null
+    ): Result<Unit> {
+        return try {
+            val sessionEntity = AttendanceSessionEntity(
+                sessionId = sessionId,
+                studentEmail = studentEmail,
+                attendanceStatus = attendanceStatus,
+                markedAt = System.currentTimeMillis(),
+                markedVia = markedVia
+            )
+            attendanceDao.insertSession(sessionEntity)
+            
+            // Sync to Supabase
+            val request = CreateAttendanceSessionRequest(
+                session_id = sessionId,
+                student_email = studentEmail,
+                attendance_status = attendanceStatus,
+                marked_via = markedVia
+            )
+            supabaseApiService.createAttendanceSession(request)
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getAttendanceSessionsForClass(classId: Int): Flow<List<AttendanceSessionEntity>> {
+        return attendanceDao.getSessionsForClass(classId)
+    }
+
+    suspend fun syncAttendanceSessionsFromSupabase(sessionId: Int): Result<Unit> {
+        return try {
+            val result = supabaseApiService.getAttendanceSessionsBySession(sessionId)
+            result.getOrNull()?.forEach { supabaseSession ->
+                val sessionEntity = AttendanceSessionEntity(
+                    sessionId = supabaseSession.session_id,
+                    studentEmail = supabaseSession.student_email,
+                    attendanceStatus = supabaseSession.attendance_status,
+                    markedAt = supabaseSession.marked_at,
+                    markedVia = supabaseSession.marked_via
+                )
+                attendanceDao.insertSession(sessionEntity)
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // Student Group operations
+    suspend fun createStudentGroup(
+        groupId: String,
+        branch: String,
+        admissionYear: Int,
+        graduationYear: Int,
+        division: String,
+        batch: Int,
+        semester: Int,
+        academicConfigId: Int
+    ): Result<Unit> {
+        return try {
+            val groupEntity = StudentGroupEntity(
+                groupId = groupId,
+                branch = branch,
+                admissionYear = admissionYear,
+                graduationYear = graduationYear,
+                division = division,
+                batch = batch,
+                semester = semester,
+                academicConfigId = academicConfigId
+            )
+            
+            // Create locally first
+            studentGroupDao.insertGroup(groupEntity)
+            println("✅ Student group created locally: $groupId")
+            
+            // Sync to Supabase
+            println("🔄 Syncing student group to Supabase...")
+            val request = CreateStudentGroupRequest(
+                group_id = groupId,
+                branch = branch,
+                admission_year = admissionYear,
+                graduation_year = graduationYear,
+                division = division,
+                batch = batch,
+                semester = semester,
+                academic_config_id = academicConfigId
+            )
+            println("🔍 Supabase request data:")
+            println("   - group_id: ${request.group_id}")
+            println("   - branch: ${request.branch}")
+            println("   - admission_year: ${request.admission_year}")
+            println("   - graduation_year: ${request.graduation_year}")
+            println("   - division: ${request.division}")
+            println("   - batch: ${request.batch}")
+            println("   - semester: ${request.semester}")
+            println("   - academic_config_id: ${request.academic_config_id}")
+            
+            val supabaseResult = supabaseApiService.createStudentGroup(request)
+            if (supabaseResult.isSuccess) {
+                println("✅ Student group synced to Supabase successfully")
+            } else {
+                println("⚠️ Failed to sync student group to Supabase: ${supabaseResult.exceptionOrNull()?.message}")
+                supabaseResult.exceptionOrNull()?.printStackTrace()
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            println("❌ Failed to create student group: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getGroupById(groupId: String): Flow<StudentGroupEntity?> {
+        return studentGroupDao.getGroupById(groupId)
+    }
+
+    // Academic Config operations
+    suspend fun createAcademicConfig(
+        programName: String,
+        durationYears: Int,
+        totalSemesters: Int,
+        semesterDurationMonths: Int
+    ): Result<Unit> {
+        return try {
+            val configEntity = AcademicConfigEntity(
+                programName = programName,
+                durationYears = durationYears,
+                totalSemesters = totalSemesters,
+                semesterDurationMonths = semesterDurationMonths
+            )
+            
+            // Create locally first
+            academicConfigDao.insertConfig(configEntity)
+            println("✅ Academic config created locally: $programName")
+            
+            // Sync to Supabase
+            println("🔄 Syncing academic config to Supabase...")
+            val request = CreateAcademicConfigRequest(
+                program_name = programName,
+                duration_years = durationYears,
+                total_semesters = totalSemesters,
+                semester_duration_months = semesterDurationMonths,
+                is_active = true
+            )
+            val supabaseResult = supabaseApiService.createAcademicConfig(request)
+            if (supabaseResult.isSuccess) {
+                println("✅ Academic config synced to Supabase successfully")
+            } else {
+                println("⚠️ Failed to sync academic config to Supabase: ${supabaseResult.exceptionOrNull()?.message}")
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            println("❌ Failed to create academic config: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getActiveConfig(): Flow<AcademicConfigEntity?> {
+        return academicConfigDao.getActiveConfig()
+    }
+
+    // Utility methods for offline/online sync
+    suspend fun syncAllDataFromSupabase(): Result<Unit> {
+        return try {
+            println("🔄 Starting full sync from Supabase...")
+            
+            // Sync all teachers
+            val teachersResult = supabaseApiService.getAllTeachers()
+            if (teachersResult.isSuccess) {
+                val teachers = teachersResult.getOrNull() ?: emptyList()
+                println("📝 Syncing ${teachers.size} teachers to local database...")
+                teachers.forEach { supabaseTeacher ->
+                    println("   - Syncing teacher: ${supabaseTeacher.name} (${supabaseTeacher.email})")
+                    val teacherEntity = TeacherEntity(
+                        email = supabaseTeacher.email,
+                        name = supabaseTeacher.name,
+                        subject = supabaseTeacher.subject
+                    )
+                    teacherDao.insertTeacher(teacherEntity)
+                }
+                println("✅ Teachers synced successfully")
+            } else {
+                println("⚠️ Failed to sync teachers: ${teachersResult.exceptionOrNull()?.message}")
+            }
+            
+            // Sync all classes
+            val classesResult = supabaseApiService.getAllClasses()
+            if (classesResult.isSuccess) {
+                val classes = classesResult.getOrNull() ?: emptyList()
+                println("📝 Syncing ${classes.size} classes to local database...")
+                classes.forEach { supabaseClass ->
+                    println("   - Syncing class: ${supabaseClass.subject_name} | Schedule: '${supabaseClass.class_schedule}' | Teacher: ${supabaseClass.teacher_email}")
+                    
+                    // Check if teacher exists locally
+                    val teacherExists = try {
+                        val allTeachers = teacherDao.getAllTeachers().first()
+                        allTeachers.any { it.email == supabaseClass.teacher_email }
+                    } catch (e: Exception) {
+                        false
+                    }
+                    
+                    if (!teacherExists) {
+                        println("   - ⚠️ Teacher ${supabaseClass.teacher_email} not found locally, skipping class")
+                        return@forEach
+                    }
+                    
+                    // Check if group exists locally
+                    val groupExists = try {
+                        studentDao.getStudentGroupById(supabaseClass.group_id) != null
+                    } catch (e: Exception) {
+                        false
+                    }
+                    
+                    if (!groupExists) {
+                        println("   - ⚠️ Group ${supabaseClass.group_id} not found locally, skipping class")
+                        return@forEach
+                    }
+                    
+                    val classEntity = ClassEntity(
+                        classId = supabaseClass.class_id ?: 0,
+                        teacherEmail = supabaseClass.teacher_email,
+                        subjectName = supabaseClass.subject_name,
+                        groupId = supabaseClass.group_id,
+                        classSchedule = supabaseClass.class_schedule
+                    )
+                    val insertedId = teacherDao.insertClass(classEntity)
+                    println("   - ✅ Synced class with local ID: $insertedId")
+                }
+                println("✅ Classes synced successfully")
+            } else {
+                println("⚠️ Failed to sync classes: ${classesResult.exceptionOrNull()?.message}")
+            }
+            
+            // Sync all assignments
+            val assignmentsResult = supabaseApiService.getAllAssignments()
+            if (assignmentsResult.isSuccess) {
+                val assignments = assignmentsResult.getOrNull() ?: emptyList()
+                println("📝 Syncing ${assignments.size} assignments to local database...")
+                assignments.forEach { supabaseAssignment ->
+                    println("   - Syncing assignment: ${supabaseAssignment.title} | Class: ${supabaseAssignment.class_id} | Teacher: ${supabaseAssignment.created_by}")
+                    
+                    // Check if teacher exists locally
+                    val teacherExists = try {
+                        val allTeachers = teacherDao.getAllTeachers().first()
+                        allTeachers.any { it.email == supabaseAssignment.created_by }
+                    } catch (e: Exception) {
+                        false
+                    }
+                    
+                    if (!teacherExists) {
+                        println("   - ⚠️ Teacher ${supabaseAssignment.created_by} not found locally, skipping assignment")
+                        return@forEach
+                    }
+                    
+                    // Check if class exists locally (if classId is provided)
+                    if (supabaseAssignment.class_id != null && supabaseAssignment.class_id > 0) {
+                        val classExists = try {
+                            val allClasses = teacherDao.getAllClasses().first()
+                            allClasses.any { it.classId == supabaseAssignment.class_id }
+                        } catch (e: Exception) {
+                            false
+                        }
+                        
+                        if (!classExists) {
+                            println("   - ⚠️ Class ${supabaseAssignment.class_id} not found locally, skipping assignment")
+                            return@forEach
+                        }
+                    }
+                    
+                    val assignmentEntity = AssignmentEntity(
+                        id = supabaseAssignment.id,
+                        title = supabaseAssignment.title,
+                        description = supabaseAssignment.description,
+                        fileUrl = supabaseAssignment.file_url,
+                        dueDate = supabaseAssignment.due_date,
+                        createdBy = supabaseAssignment.created_by,
+                        classId = supabaseAssignment.class_id,
+                        maxMarks = supabaseAssignment.max_marks ?: 100
+                    )
+                    assignmentDao.insertAssignment(assignmentEntity)
+                    println("   - ✅ Synced assignment with ID: ${assignmentEntity.id}")
+                }
+                println("✅ Assignments synced successfully")
+            } else {
+                println("⚠️ Failed to sync assignments: ${assignmentsResult.exceptionOrNull()?.message}")
+            }
+            
+            // Sync all class sessions
+            val allClasses = classesResult.getOrNull() ?: emptyList()
+            println("📝 Syncing class sessions for ${allClasses.size} classes...")
+            allClasses.forEach { supabaseClass ->
+                supabaseClass.class_id?.let { classId ->
+                    val sessionsResult = supabaseApiService.getClassSessionsByClass(classId)
+                    if (sessionsResult.isSuccess) {
+                        val sessions = sessionsResult.getOrNull() ?: emptyList()
+                        println("   - Syncing ${sessions.size} sessions for class $classId")
+                        sessions.forEach { supabaseSession ->
+                            supabaseSession.session_id?.let { sessionId ->
+                                val sessionEntity = ClassSessionEntity(
+                                    sessionId = sessionId,
+                                    classId = supabaseSession.class_id,
+                                    scheduledDate = supabaseSession.scheduled_date,
+                                    startTime = supabaseSession.start_time,
+                                    endTime = supabaseSession.end_time,
+                                    sessionCode = supabaseSession.session_code,
+                                    status = supabaseSession.status
+                                )
+                                classSessionDao.insertSession(sessionEntity)
+                                println("     - Synced session: ${sessionEntity.sessionCode} (${sessionEntity.scheduledDate})")
+                                
+                                // Sync attendance for this session
+                                val attendanceResult = supabaseApiService.getAttendanceSessionsBySession(sessionId)
+                                if (attendanceResult.isSuccess) {
+                                    val attendanceSessions = attendanceResult.getOrNull() ?: emptyList()
+                                    println("     - Syncing ${attendanceSessions.size} attendance records for session $sessionId")
+                                    attendanceSessions.forEach { supabaseAttendance ->
+                                        val attendanceEntity = AttendanceSessionEntity(
+                                            sessionId = supabaseAttendance.session_id,
+                                            studentEmail = supabaseAttendance.student_email,
+                                            attendanceStatus = supabaseAttendance.attendance_status,
+                                            markedAt = supabaseAttendance.marked_at,
+                                            markedVia = supabaseAttendance.marked_via
+                                        )
+                                        attendanceDao.insertSession(attendanceEntity)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        println("   - Failed to sync sessions for class $classId: ${sessionsResult.exceptionOrNull()?.message}")
+                    }
+                }
+            }
+            println("✅ Class sessions and attendance synced successfully")
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            println("❌ Full sync failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // Assignment Repository Methods - Reusing existing patterns from class and attendance operations
+    
+    suspend fun createAssignment(
+        title: String,
+        description: String?,
+        fileUrl: String?,
+        dueDate: Long,
+        teacherEmail: String,
+        classId: Int?,
+        maxMarks: Int = 100
+    ): Result<String> {
+        return try {
+            println("🔄 Creating assignment: title=$title, dueDate=$dueDate, teacher=$teacherEmail")
+            
+            // First, save to local database
+            val assignmentId = java.util.UUID.randomUUID().toString()
+            val assignmentEntity = AssignmentEntity(
+                id = assignmentId,
+                title = title,
+                description = description,
+                fileUrl = fileUrl,
+                dueDate = dueDate,
+                createdBy = teacherEmail,
+                classId = classId ?: 0, // Use 0 if classId is null to avoid foreign key issues
+                maxMarks = maxMarks
+            )
+            
+            try {
+                assignmentDao.insertAssignment(assignmentEntity)
+                println("✅ Assignment saved locally with ID: $assignmentId")
+            } catch (e: Exception) {
+                println("❌ Failed to save assignment locally: ${e.message}")
+                // Continue with Supabase sync even if local save fails
+            }
+            
+            // Then, sync to Supabase with timeout
+            // Try a simpler date format first
+            val dateFormatter = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.getDefault())
+            dateFormatter.timeZone = java.util.TimeZone.getTimeZone("UTC")
+            val formattedDueDate = dateFormatter.format(java.util.Date(dueDate))
+            
+            println("🔄 Preparing Supabase request:")
+            println("   - Title: '$title'")
+            println("   - Description: '$description'")
+            println("   - File URL: '$fileUrl'")
+            println("   - Due Date (raw): $dueDate")
+            println("   - Due Date (formatted): '$formattedDueDate'")
+            println("   - Teacher Email: '$teacherEmail'")
+            println("   - Class ID: $classId")
+            
+            val request = CreateAssignmentRequest(
+                title = title,
+                description = description,
+                file_url = fileUrl,
+                due_date = formattedDueDate,
+                created_by = teacherEmail,
+                class_id = classId
+            )
+            
+            println("🔄 Created request object: $request")
+            
+            // Test connection first
+            println("🔄 Testing Supabase connection before creating assignment...")
+            val connectionTest = withTimeout(5000) {
+                supabaseApiService.testConnection()
+            }
+            if (connectionTest.isSuccess) {
+                println("✅ Supabase connection test passed")
+            } else {
+                println("❌ Supabase connection test failed: ${connectionTest.exceptionOrNull()?.message}")
+            }
+            
+            // Test assignments table access
+            println("🔄 Testing assignments table access...")
+            val tableTest = withTimeout(5000) {
+                supabaseApiService.testAssignmentsTable()
+            }
+            if (tableTest.isSuccess) {
+                println("✅ Assignments table test passed")
+            } else {
+                println("❌ Assignments table test failed: ${tableTest.exceptionOrNull()?.message}")
+            }
+            
+            // Add timeout to prevent infinite loading
+            try {
+                val supabaseResult = withTimeout(10000) { // 10 second timeout
+                    supabaseApiService.createAssignment(request)
+                }
+                if (supabaseResult.isSuccess) {
+                    println("✅ Assignment synced to Supabase successfully")
+                } else {
+                    val error = supabaseResult.exceptionOrNull()
+                    println("⚠️ Failed to sync assignment to Supabase: ${error?.message}")
+                    
+                    // Check if it's an authentication error
+                    if (error?.message?.contains("JWT", ignoreCase = true) == true || 
+                        error?.message?.contains("auth", ignoreCase = true) == true ||
+                        error?.message?.contains("permission", ignoreCase = true) == true) {
+                        println("🔐 Authentication error detected - this is likely due to RLS policies")
+                        println("   - Assignment saved locally but not synced to Supabase")
+                        println("   - Consider setting up Supabase authentication or disabling RLS for testing")
+                    }
+                }
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                println("⚠️ Supabase sync timed out after 10 seconds - assignment saved locally only")
+            } catch (e: Exception) {
+                println("⚠️ Supabase sync failed: ${e.message} - assignment saved locally only")
+            }
+            
+            Result.success(assignmentId)
+        } catch (e: Exception) {
+            println("❌ Error creating assignment: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getAssignmentsForClass(classId: Int): Flow<List<AssignmentEntity>> {
+        return assignmentDao.getAssignmentsForClass(classId)
+    }
+    
+    suspend fun getAssignmentsByTeacher(teacherEmail: String): Flow<List<AssignmentEntity>> {
+        return assignmentDao.getAssignmentsByTeacher(teacherEmail)
+    }
+    
+    suspend fun getAssignmentById(assignmentId: String): Flow<AssignmentEntity?> {
+        return assignmentDao.getAssignmentById(assignmentId)
+    }
+    
+    suspend fun getSubmissionsForAssignment(assignmentId: String): Flow<List<SubmissionEntity>> {
+        return submissionDao.getSubmissionsForAssignment(assignmentId)
+    }
+    
+    suspend fun getStudentsInClass(classId: Int): Flow<List<StudentEntity>> {
+        return studentDao.getStudentsByClass(classId)
+    }
+
+    suspend fun getAllAssignments(): Flow<List<AssignmentEntity>> {
+        return assignmentDao.getAllAssignments()
+    }
+
+    // Submission Repository Methods - Reusing patterns from attendance operations
+    
+    suspend fun createSubmission(
+        assignmentId: String,
+        studentEmail: String,
+        fileUrl: String?,
+        status: String = "submitted"
+    ): Result<String> {
+        return try {
+            println("🔄 Creating submission: assignmentId=$assignmentId, student=$studentEmail")
+            
+            // First, save to local database
+            val submissionEntity = SubmissionEntity(
+                assignmentId = assignmentId,
+                studentEmail = studentEmail,
+                fileUrl = fileUrl,
+                submittedAt = if (status == "submitted" || status == "late") System.currentTimeMillis() else null,
+                status = status
+            )
+            submissionDao.insertSubmission(submissionEntity)
+            println("✅ Submission saved locally")
+            
+            // Then, sync to Supabase
+            val request = CreateSubmissionRequest(
+                assignment_id = assignmentId,
+                student_email = studentEmail,
+                file_url = fileUrl
+            )
+            val supabaseResult = supabaseApiService.createSubmission(request)
+            if (supabaseResult.isSuccess) {
+                println("✅ Submission synced to Supabase successfully")
+            } else {
+                println("⚠️ Failed to sync submission to Supabase: ${supabaseResult.exceptionOrNull()?.message}")
+            }
+            
+            Result.success("Submission created successfully")
+        } catch (e: Exception) {
+            println("❌ Error creating submission: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getSubmissionsByStudent(studentEmail: String): Flow<List<SubmissionEntity>> {
+        return submissionDao.getSubmissionsByStudent(studentEmail)
+    }
+
+    suspend fun getSubmissionByStudent(assignmentId: String, studentEmail: String): SubmissionEntity? {
+        return submissionDao.getSubmissionByStudent(assignmentId, studentEmail)
+    }
+
+    suspend fun updateSubmission(submission: SubmissionEntity): Result<Unit> {
+        return try {
+            submissionDao.updateSubmission(submission)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun syncAllDataForTeacher(teacherEmail: String): Result<Unit> {
+        return try {
+            // Sync teacher profile
+            syncTeacherFromSupabase(teacherEmail)
+            
+            // Sync classes
+            syncClassesFromSupabase(teacherEmail)
+            
+            // For each class, sync class sessions and attendance
+            val classesResult = supabaseApiService.getClassesByTeacher(teacherEmail)
+            classesResult.getOrNull()?.forEach { supabaseClass ->
+                supabaseClass.class_id?.let { classId ->
+                    // Sync class sessions
+                    val sessionsResult = supabaseApiService.getClassSessionsByClass(classId)
+                    sessionsResult.getOrNull()?.forEach { supabaseSession ->
+                        supabaseSession.session_id?.let { sessionId ->
+                            val sessionEntity = ClassSessionEntity(
+                                sessionId = sessionId,
+                                classId = supabaseSession.class_id,
+                                scheduledDate = supabaseSession.scheduled_date,
+                                startTime = supabaseSession.start_time,
+                                endTime = supabaseSession.end_time,
+                                sessionCode = supabaseSession.session_code,
+                                status = supabaseSession.status
+                            )
+                            classSessionDao.insertSession(sessionEntity)
+                            
+                            // Sync attendance for this session
+                            syncAttendanceSessionsFromSupabase(sessionId)
+                        }
+                    }
+                }
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+}

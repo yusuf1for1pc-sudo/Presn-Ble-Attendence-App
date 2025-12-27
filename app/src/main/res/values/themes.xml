@@ -1,0 +1,7 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <!-- We are temporarily using a basic theme to diagnose the linking error. -->
+    <style name="Theme.BLEAttendance" parent="android:Theme.DeviceDefault.Light.NoActionBar">
+        <!-- No custom items are needed for this test -->
+    </style>
+</resources>
